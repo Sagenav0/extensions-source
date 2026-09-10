@@ -1,0 +1,55 @@
+name: Compilar APK privado de ZonaTMO
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Descargar la rama de prueba
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix-zonatmo-latest
+          persist-credentials: false
+
+      - name: Configurar Java
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb
+
+      - name: Crear clave temporal
+        run: |
+          keytool -genkeypair -noprompt \
+            -keystore signingkey.jks \
+            -storepass android \
+            -keypass android \
+            -alias testkey \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=ZonaTMO Test"
+
+      - name: Compilar y ejecutar lint
+        env:
+          ALIAS: testkey
+          KEY_STORE_PASSWORD: android
+          KEY_PASSWORD: android
+        run: |
+          ./gradlew :src:es:zonatmoorgunoriginal:assembleRelease :src:es:zonatmoorgunoriginal:lintRelease --no-daemon
+
+      - name: Guardar APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: zonatmoorgunoriginal-test-apk
+          path: src/es/zonatmoorgunoriginal/build/outputs/apk/release/*.apk
+          retention-days: 1
