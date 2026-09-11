@@ -13,9 +13,18 @@ import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getString
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.textOrNull
 import keiyoushi.utils.tryParseDate
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -29,18 +38,113 @@ import java.util.Locale
 @Source
 abstract class ZonaTmoOrgUnoriginal : KeiSource() {
     override fun OkHttpClient.Builder.configureClient() = apply {
-        rateLimit(2) { it.host == baseUrl.toHttpUrl().host }
+        rateLimit(8) { it.host == baseUrl.toHttpUrl().host }
     }
 
     private val ajaxHeaders: Headers
-        get() = headersBuilder()
-            .set("Referer", "$baseUrl/biblioteca")
-            .set("X-Requested-With", "XMLHttpRequest")
-            .build()
+        get() =
+            headersBuilder()
+                .set("Referer", "$baseUrl/biblioteca")
+                .set("X-Requested-With", "XMLHttpRequest")
+                .build()
+
+    private val latestCanonicalUrls =
+        object : LinkedHashMap<String, String>(128, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 500
+        }
+    private val latestCanonicalUrlsLock = Any()
 
     override suspend fun getPopularManga(page: Int): MangasPage = getMangaList(page, order = "likes_count")
 
-    override suspend fun getLatestUpdates(page: Int): MangasPage = getMangaList(page, order = "release_date")
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val url =
+            "$baseUrl/ultimas-subidas"
+                .toHttpUrl()
+                .newBuilder()
+                .addQueryParameter("page", page.toString())
+                .build()
+        val document = client.get(url).asJsoup()
+
+        val seenMangaKeysOnPage = mutableSetOf<String>()
+        val mangaCandidates =
+            document.select(".upload-file-row").mapNotNull { element ->
+                val title = element.selectFirst(".thumbnail-title h4")?.textOrNull() ?: return@mapNotNull null
+                val link = element.selectFirst("a[href*=/view_uploads/]") ?: return@mapNotNull null
+                val thumbnailUrl =
+                    element
+                        .selectFirst("style")
+                        ?.data()
+                        ?.let { backgroundImageRegex.find(it)?.groupValues?.get(1) }
+                val mangaKey = "${title.lowercase(Locale.ROOT)}|${thumbnailUrl?.substringBefore('?').orEmpty()}"
+                if (!seenMangaKeysOnPage.add(mangaKey)) return@mapNotNull null
+
+                mangaKey to
+                    SManga.create().apply {
+                        setUrlWithoutDomain(link.attr("abs:href"))
+                        this.title = title
+                        thumbnail_url = thumbnailUrl
+                    }
+            }
+
+        val canonicalMangas =
+            coroutineScope {
+                mangaCandidates.map { (mangaKey, manga) ->
+                    async {
+                        val cachedUrl =
+                            synchronized(latestCanonicalUrlsLock) {
+                                latestCanonicalUrls[mangaKey]
+                            }
+                        val mangaUrl =
+                            cachedUrl ?: try {
+                                resolveLatestMangaUrl(manga.title, manga.url)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                null
+                            }
+
+                        mangaUrl?.let { resolvedUrl ->
+                            synchronized(latestCanonicalUrlsLock) {
+                                latestCanonicalUrls[mangaKey] = resolvedUrl
+                            }
+                            manga.setUrlWithoutDomain(resolvedUrl)
+                        }
+                        manga
+                    }
+                }.awaitAll()
+            }
+
+        return MangasPage(canonicalMangas, document.selectFirst("a[rel=next]") != null)
+    }
+
+    private suspend fun resolveLatestMangaUrl(
+        title: String,
+        uploadUrl: String,
+    ): String? {
+        val searchUrl =
+            "$baseUrl/api/search/suggest"
+                .toHttpUrl()
+                .newBuilder()
+                .addQueryParameter("q", title)
+                .build()
+        val exactMatch =
+            client.get(searchUrl).parseAs<JsonArray>().firstNotNullOfOrNull { result ->
+                val item = result.jsonObject
+                val resultTitle = item["title"]?.jsonPrimitive?.contentOrNull
+                val resultUrl = item["url"]?.jsonPrimitive?.contentOrNull
+                resultUrl?.takeIf {
+                    resultTitle?.trim()?.equals(title.trim(), ignoreCase = true) == true &&
+                        "/library/" in it
+                }
+            }
+        if (exactMatch != null) return exactMatch
+
+        return client
+            .get(baseUrl + uploadUrl)
+            .asJsoup()
+            .selectFirst("a.btn-rh[href*=/library/]")
+            ?.attr("abs:href")
+    }
 
     override suspend fun getSearchMangaList(
         page: Int,
@@ -116,7 +220,18 @@ abstract class ZonaTmoOrgUnoriginal : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val document = client.get(baseUrl + manga.url).asJsoup()
+        val initialDocument = client.get(baseUrl + manga.url).asJsoup()
+        val document =
+            if (manga.url.startsWith("/view_uploads/")) {
+                val mangaUrl =
+                    initialDocument
+                        .selectFirst("a.btn-rh[href*=/library/]")
+                        ?.attr("abs:href")
+                        ?: throw Exception("No se encontró la ficha del manga")
+                client.get(mangaUrl).asJsoup()
+            } else {
+                initialDocument
+            }
         return SMangaUpdate(
             manga = parseMangaDetails(document),
             chapters = parseChapterList(document),
@@ -186,12 +301,13 @@ abstract class ZonaTmoOrgUnoriginal : KeiSource() {
                 row.attr("data-chapter-number").ifBlank {
                     row.selectFirst(".chapter-number")?.attr("data-number").orEmpty()
                 }
-            val date = dateFormat.tryParseDate(
-                row
-                    .selectFirst(".text-muted.small")
-                    ?.text()
-                    ?.substringAfterLast(" "),
-            )
+            val date =
+                dateFormat.tryParseDate(
+                    row
+                        .selectFirst(".text-muted.small")
+                        ?.text()
+                        ?.substringAfterLast(" "),
+                )
 
             row.select(".chapter-detail a[href*=/view_uploads/]").map { link ->
                 SChapter.create().apply {
@@ -223,6 +339,7 @@ abstract class ZonaTmoOrgUnoriginal : KeiSource() {
     override fun getFilterList(data: JsonElement?): FilterList = FilterList()
 
     companion object {
+        private val backgroundImageRegex = """background-image:\s*url\(['"]?([^'")]+)""".toRegex()
         private val dateFormat = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.ROOT)
     }
 }
